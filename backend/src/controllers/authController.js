@@ -181,6 +181,27 @@ function makeRedisStore(client) {
       }
       return result;
     },
+    // Older deployments indexed refresh tokens by hash alone. Sweep the
+    // existing keyspace once during password changes to remove those keys too.
+    async purgeUserTokens(userId, passwordVersion) {
+      let cursor = '0';
+      do {
+        const [nextCursor, keys] = await client.scan(cursor, 'MATCH', 'refresh:token:*', 'COUNT', 200);
+        cursor = nextCursor;
+        if (!keys.length) continue;
+        const values = await client.mget(...keys);
+        const staleKeys = keys.filter((key, index) => {
+          if (!values[index]) return false;
+          try {
+            const meta = JSON.parse(values[index]);
+            return meta.userId === userId && (meta.passwordVersion ?? 0) < passwordVersion;
+          } catch {
+            return false;
+          }
+        });
+        if (staleKeys.length) await client.del(...staleKeys);
+      } while (cursor !== '0');
+    },
     // Revoke all session families for a given userId. Used by admin endpoints
     // and by handleChangePassword.
     async revokeUserSessions(userId, ttlSeconds) {
@@ -420,10 +441,8 @@ async function issueRefreshToken(store, jwtPayload, refreshTTL, req) {
   const sessionId = crypto.randomBytes(16).toString('hex');
   const refreshToken = crypto.randomBytes(40).toString('hex');
   const familyExpiresAt = new Date(Date.now() + refreshTTL * 1000);
-  jwtPayload.familyId = familyId;
+  Object.assign(jwtPayload, { familyId, sessionId });
   const tokenMeta = {
-    familyId,
-    sessionId,
     ...jwtPayload,
     familyExpiresAt: familyExpiresAt.toISOString(),
   };
@@ -749,7 +768,7 @@ async function handleRefresh(req, res) {
   }
 
   // Reconstruct JWT payload from stored metadata
-  const jwtPayload = { familyId: meta.familyId };
+  const jwtPayload = { familyId: meta.familyId, sessionId: meta.sessionId };
   if (meta.userId && meta.userId !== 'super_admin') jwtPayload.passwordVersion = meta.passwordVersion ?? 0;
   if (meta.role)     jwtPayload.role     = meta.role;
   if (meta.userId)   jwtPayload.userId   = meta.userId;
@@ -985,12 +1004,13 @@ async function changePassword(req, res, resetUserId) {
   }
 
   const newHash = await bcrypt.hash(newPassword, 12);
+  const passwordChangedAt = new Date();
 
   try {
     const User = require('../models/userModel');
     const updated = await User.findOneAndUpdate(
       { _id: userId, passwordHash: user.passwordHash },
-      { $set: { passwordHash: newHash, passwordChangedAt: new Date() } },
+      { $set: { passwordHash: newHash, passwordChangedAt } },
     );
     if (!updated) return res.status(409).json({ error: 'Password already changed.', code: 'PASSWORD_CHANGED' });
   } catch (err) {
@@ -1003,7 +1023,13 @@ async function changePassword(req, res, resetUserId) {
   const store = getStore();
   const refreshTTL = parseTTL('JWT_REFRESH_TOKEN_TTL', 30 * 86400);
   try {
-    const count = await store.revokeUserSessions(userId, refreshTTL);
+    const [revocations, purge] = await Promise.allSettled([
+      store.revokeUserSessions(userId, refreshTTL),
+      store.purgeUserTokens?.(userId, passwordChangedAt.getTime()),
+    ]);
+    if (revocations.status === 'rejected') throw revocations.reason;
+    if (purge.status === 'rejected') throw purge.reason;
+    const count = revocations.value;
     logger.info('[AuthController] All sessions revoked after password change', { userId, count });
   } catch (err) {
     // Non-fatal: password is already updated; log and continue.
@@ -1052,6 +1078,16 @@ module.exports = {
   handleChangePassword: (req, res) => changePassword(req, res),
   handleResetPassword: (req, res) => changePassword(req, res, req.params.userId),
   isSessionRevoked: familyId => getStore().isFamilyRevoked(familyId),
+  async touchSession(sessionId) {
+    if (!sessionId) return;
+    const store = getStore();
+    const session = await store.getSession(sessionId);
+    if (!session || Date.now() - Date.parse(session.lastUsed) < 60_000) return;
+    const remainingTTL = Math.ceil((Date.parse(session.familyExpiresAt) - Date.now()) / 1000);
+    if (remainingTTL > 0) {
+      await store.setSession(sessionId, { ...session, lastUsed: new Date().toISOString() }, remainingTTL);
+    }
+  },
   _resetStore,
   // Exported for tests only — allows verifying hash storage without touching Redis
   _hashToken: hashToken,

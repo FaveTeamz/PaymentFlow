@@ -11,7 +11,13 @@ const { isPasswordSessionCurrent } = require('../services/passwordSessionService
 
 async function isSessionCurrent(decoded) {
   if (!await isPasswordSessionCurrent(decoded)) return false;
-  return !decoded.familyId || !await require('../controllers/authController').isSessionRevoked(decoded.familyId);
+  if (!decoded.familyId) return true;
+  const { isSessionRevoked, touchSession } = require('../controllers/authController');
+  if (await isSessionRevoked(decoded.familyId)) return false;
+  void touchSession(decoded.sessionId).catch(error => {
+    logger.debug('Unable to update session last active time', { error: error.message });
+  });
+  return true;
 }
 
 // ── IP failure tracking constants ──────────────────────────────────────────────
