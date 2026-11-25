@@ -1,7 +1,7 @@
 'use strict';
 
 const { Keypair, Horizon, Networks, Operation, TransactionBuilder } = require('@stellar/stellar-sdk');
-const StellarHDWallet = require('stellar-hd-wallet');
+const StellarHDWallet = require('stellar-hd-wallet').default;
 const settings = require('./stellar-accounts.json');
 
 function createStellarTestnetPool(suite) {

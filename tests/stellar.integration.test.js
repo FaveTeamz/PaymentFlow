@@ -9,8 +9,7 @@
  *
  * They are intentionally excluded from normal CI runs.
  *
- * Run manually with:
- *   See docs/stellar-testnet-fixtures.md
+ * Run with npm run test:integration after configuring the fixture environment.
  */
 
 const ENABLED = process.env.RUN_INTEGRATION_TESTS === 'true';
@@ -31,7 +30,7 @@ if (ENABLED) {
 
   // Set env vars required by stellarService before importing it
   process.env.MONGO_URI             = process.env.MONGO_URI || 'mongodb://localhost:27017/stellaredupay_integration_test';
-  process.env.SCHOOL_WALLET_ADDRESS = process.env.SCHOOL_WALLET_ADDRESS || 'PLACEHOLDER';
+  process.env.JWT_SECRET = process.env.JWT_SECRET || 'stellar-integration-test-jwt-secret';
   process.env.STELLAR_NETWORK       = 'testnet';
 
   ({ syncPaymentsForSchool, extractValidPayment } = require('../backend/src/services/stellarService'));
@@ -85,6 +84,8 @@ async function waitForTransaction(txHash, maxWaitMs = 30_000) {
 
 describeIf('Stellar Testnet Integration', () => {
   let pool;
+  let mongoServer;
+  let mongoose;
   let senderKeypair;    // pays fees
   let schoolKeypair;    // receives payments (acts as school wallet)
 
@@ -95,6 +96,10 @@ describeIf('Stellar Testnet Integration', () => {
   jest.setTimeout(60_000);
 
   beforeAll(async () => {
+    mongoose = require('../backend/node_modules/mongoose');
+    const { MongoMemoryReplSet } = require('mongodb-memory-server');
+    mongoServer = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
+    await mongoose.connect(mongoServer.getUri());
     const { createStellarTestnetPool } = require('./fixtures/stellarTestnetPool');
     pool = createStellarTestnetPool('integration');
     await pool.setup();
@@ -103,9 +108,14 @@ describeIf('Stellar Testnet Integration', () => {
   });
 
   afterAll(async () => {
-    if (senderKeypair) pool.release(senderKeypair);
-    if (schoolKeypair) pool.release(schoolKeypair);
-    await pool?.cleanup();
+    try {
+      if (senderKeypair) pool.release(senderKeypair);
+      if (schoolKeypair) pool.release(schoolKeypair);
+      await pool?.cleanup();
+    } finally {
+      await mongoose?.disconnect();
+      await mongoServer?.stop();
+    }
   });
 
   describe('Fixture funding', () => {

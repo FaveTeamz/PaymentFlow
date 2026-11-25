@@ -17,7 +17,8 @@
  *
  * Run manually:
  *   RUN_TESTNET_E2E_TESTS=true STELLAR_INTEGRATION_TESTS=true \
- *     npx jest tests/e2e/paymentPipelineTestnet.e2e.test.js --forceExit --runInBand
+ *     npx jest tests/e2e/paymentPipelineTestnet.e2e.test.js --runInBand \
+ *       --testPathIgnorePatterns=/node_modules/ --moduleNameMapper='{}'
  *
  * Configure the fixture master and mnemonic as described in docs/stellar-testnet-fixtures.md.
  */
@@ -27,12 +28,12 @@ const describeIf = ENABLED ? describe : describe.skip;
 
 // Required env for the backend modules (set before any require)
 process.env.MONGO_URI    = process.env.MONGO_URI    || 'mongodb://localhost:27017/e2e-testnet-test';
-process.env.JWT_SECRET   = process.env.JWT_SECRET   || 'e2e-testnet-secret-12345678';
+process.env.JWT_SECRET   = process.env.JWT_SECRET   || 'e2e-testnet-fixtures-jwt-secret-0000';
 process.env.STELLAR_NETWORK = 'testnet';
 
 // Only load heavy deps when enabled to avoid slowing down the normal test suite
 let StellarSdk, Networks, TransactionBuilder, Operation, Asset, BASE_FEE, Memo;
-let mongoose, MongoMemoryServer;
+let mongoose, MongoMemoryReplSet;
 let School, Student, Payment, PaymentIntent, Receipt;
 let paymentController;
 let webhookService, sseService;
@@ -42,7 +43,7 @@ if (ENABLED) {
   ({ Networks, TransactionBuilder, Operation, Asset, BASE_FEE, Memo } = StellarSdk);
 
   mongoose         = require('../../backend/node_modules/mongoose');
-  MongoMemoryServer = require('mongodb-memory-server').MongoMemoryServer;
+  MongoMemoryReplSet = require('mongodb-memory-server').MongoMemoryReplSet;
 
   School        = require('../../backend/src/models/schoolModel');
   Student       = require('../../backend/src/models/studentModel');
@@ -144,7 +145,7 @@ describeIf('Full payment pipeline — live Stellar testnet (#1361)', () => {
 
   beforeAll(async () => {
     // ── Start in-memory MongoDB ──────────────────────────────────────────────
-    mongoServer = await MongoMemoryServer.create();
+    mongoServer = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
     await mongoose.connect(mongoServer.getUri());
 
     const { createStellarTestnetPool } = require('../fixtures/stellarTestnetPool');

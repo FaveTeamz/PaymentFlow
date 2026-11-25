@@ -15,8 +15,13 @@ Each suite leases its sender and recipient for the duration of its sequential
 payment scenarios. The pool hands out each key exclusively and returns funds
 to the master by merging the accounts during teardown.
 
-Run the live suites with their respective flags (`RUN_INTEGRATION_TESTS=true`
-or `RUN_TESTNET_E2E_TESTS=true`) and `STELLAR_INTEGRATION_TESTS=true`. The root
-Jest configuration excludes live suites by default. Override
-`testPathIgnorePatterns` with `--testPathIgnorePatterns=/node_modules/` when
-invoking Jest with the full path to one of these suites.
+Run the integration suite with `npm run test:integration` from the root.
+For the payment pipeline suite, run:
+
+```sh
+RUN_TESTNET_E2E_TESTS=true STELLAR_INTEGRATION_TESTS=true \
+  npx jest tests/e2e/paymentPipelineTestnet.e2e.test.js --runInBand \
+  --testPathIgnorePatterns=/node_modules/ --moduleNameMapper='{}'
+```
+
+Both commands use the real HTTP client and an in-memory MongoDB replica set.
