@@ -7,6 +7,13 @@ const { get, set } = require('../cache');
 const { sendAdminAlert } = require('../services/alertService');
 const { getRedisClient, isRedisReady } = require('../config/redisClient');
 
+const { isPasswordSessionCurrent } = require('../services/passwordSessionService');
+
+async function isSessionCurrent(decoded) {
+  if (!await isPasswordSessionCurrent(decoded)) return false;
+  return !decoded.familyId || !await require('../controllers/authController').isSessionRevoked(decoded.familyId);
+}
+
 // ── IP failure tracking constants ──────────────────────────────────────────────
 const IP_FAIL_WINDOW = 300;  // 5 minutes (seconds)
 const IP_FAIL_THRESHOLD = 5; // block after 5 failures
@@ -131,6 +138,9 @@ async function requireAdminAuth(req, res, next) {
     }
 
     const decoded = jwt.verify(token, secret);
+    if (!await isSessionCurrent(decoded)) {
+      return res.status(401).json({ error: 'Session has been revoked.', code: 'SESSION_REVOKED' });
+    }
 
     // Accept the old role:'admin' shape AND the new roles:['super_admin'] shape
     const isSuperAdmin =
@@ -209,6 +219,9 @@ function requireSchoolAuth(allowedRoles = []) {
         return res.status(500).json({ error: 'Server misconfiguration: JWT_SECRET is not set.', code: 'AUTH_MISCONFIGURED' });
       }
       decoded = jwt.verify(token, secret);
+      if (!await isSessionCurrent(decoded)) {
+        return res.status(401).json({ error: 'Session has been revoked.', code: 'SESSION_REVOKED' });
+      }
     } catch (err) {
       if (err.name === 'TokenExpiredError') {
         return handleAuthFailure(req, res, ip, 'Token has expired.', 'TOKEN_EXPIRED', { countTowardsBlock: false });
@@ -275,6 +288,6 @@ function requireSchoolAuth(allowedRoles = []) {
 
 // Endpoints reachable with a restricted mfaSetupPending token — just enough
 // to complete MFA enrollment or abandon the session.
-const MFA_SETUP_ALLOWED_PATHS = new Set(['/mfa/user/setup', '/mfa/user/verify']);
+const MFA_SETUP_ALLOWED_PATHS = new Set(['/me', '/mfa/user/setup', '/mfa/user/verify']);
 
 module.exports = { requireAdminAuth, requireSchoolAuth };

@@ -538,6 +538,7 @@ export default function Navbar() {
               {dark ? <SunIcon /> : <MoonIcon />}
             </button>
             {isAdmin && <NotificationCenter />}
+            {isAdmin && <Link href="/account-settings" className="nav-pill">Account settings</Link>}
             {isAdmin
               ? <button className="nav-pill" onClick={logout}>{t("actions.signOut")}</button>
               : <Link href="/login" className="nav-pill nav-pill-accent">{t("nav.adminLogin")}</Link>
@@ -590,6 +591,7 @@ export default function Navbar() {
           )
         ))}
         <div className="nav-mobile-divider" />
+        {isAdmin && <Link href="/account-settings" onClick={closeMenu}>Account settings</Link>}
         {isAdmin
           ? <button className="nav-pill" onClick={() => { logout(); setOpen(false); }} style={{ marginTop: "0.25rem", width: "fit-content" }}>{t("actions.signOut")}</button>
           : <Link href="/login" className="nav-pill nav-pill-accent" style={{ marginTop: "0.25rem", width: "fit-content" }} onClick={() => setOpen(false)}>{t("nav.adminLogin")}</Link>
