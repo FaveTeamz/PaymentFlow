@@ -5,12 +5,12 @@
  *
  * These tests run against the real Stellar testnet and require:
  *   - RUN_INTEGRATION_TESTS=true
- *   - Network access to horizon-testnet.stellar.org and friendbot.stellar.org
+ *   - Network access to horizon-testnet.stellar.org
  *
  * They are intentionally excluded from normal CI runs.
  *
  * Run manually with:
- *   RUN_INTEGRATION_TESTS=true npx jest tests/stellar.integration.test.js --forceExit
+ *   See docs/stellar-testnet-fixtures.md
  */
 
 const ENABLED = process.env.RUN_INTEGRATION_TESTS === 'true';
@@ -19,12 +19,12 @@ const ENABLED = process.env.RUN_INTEGRATION_TESTS === 'true';
 const describeIf = ENABLED ? describe : describe.skip;
 
 // ── Dependencies (only loaded when tests are enabled) ─────────────────────────
-let StellarSdk, Keypair, Networks, TransactionBuilder, Operation, Asset,
+let StellarSdk, Networks, TransactionBuilder, Operation, Asset,
     BASE_FEE, Memo, server, syncPaymentsForSchool, extractValidPayment;
 
 if (ENABLED) {
   StellarSdk        = require('@stellar/stellar-sdk');
-  ({ Keypair, Networks, TransactionBuilder, Operation, Asset, BASE_FEE, Memo } = StellarSdk);
+  ({ Networks, TransactionBuilder, Operation, Asset, BASE_FEE, Memo } = StellarSdk);
 
   // Point directly at testnet Horizon — bypass app config entirely
   server = new StellarSdk.Horizon.Server('https://horizon-testnet.stellar.org');
@@ -38,19 +38,6 @@ if (ENABLED) {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-/**
- * Fund a testnet account via Friendbot.
- * Friendbot returns 10 000 test XLM on first call; subsequent calls top it up.
- */
-async function fundViaFriendbot(publicKey) {
-  const res = await fetch(`https://friendbot.stellar.org?addr=${encodeURIComponent(publicKey)}`);
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`Friendbot failed (${res.status}): ${body}`);
-  }
-  return res.json();
-}
 
 /**
  * Submit a payment on the testnet from `senderKeypair` to `destinationPublicKey`.
@@ -97,7 +84,7 @@ async function waitForTransaction(txHash, maxWaitMs = 30_000) {
 // ── Test Suite ────────────────────────────────────────────────────────────────
 
 describeIf('Stellar Testnet Integration', () => {
-  // Wallets created fresh for each test run
+  let pool;
   let senderKeypair;    // pays fees
   let schoolKeypair;    // receives payments (acts as school wallet)
 
@@ -108,25 +95,20 @@ describeIf('Stellar Testnet Integration', () => {
   jest.setTimeout(60_000);
 
   beforeAll(async () => {
-    senderKeypair = Keypair.random();
-    schoolKeypair = Keypair.random();
-
-    console.log('Integration test wallets:');
-    console.log('  Sender (payer) :', senderKeypair.publicKey());
-    console.log('  School (receiver):', schoolKeypair.publicKey());
-
-    // Fund both wallets via Friendbot in parallel
-    await Promise.all([
-      fundViaFriendbot(senderKeypair.publicKey()),
-      fundViaFriendbot(schoolKeypair.publicKey()),
-    ]);
-
-    console.log('Both wallets funded via Friendbot.');
+    const { createStellarTestnetPool } = require('./fixtures/stellarTestnetPool');
+    pool = createStellarTestnetPool('integration');
+    await pool.setup();
+    senderKeypair = await pool.claim();
+    schoolKeypair = await pool.claim();
   });
 
-  // ── Friendbot ──────────────────────────────────────────────────────────────
+  afterAll(async () => {
+    if (senderKeypair) pool.release(senderKeypair);
+    if (schoolKeypair) pool.release(schoolKeypair);
+    await pool?.cleanup();
+  });
 
-  describe('Friendbot setup', () => {
+  describe('Fixture funding', () => {
     test('sender wallet has a positive XLM balance after funding', async () => {
       const account = await server.loadAccount(senderKeypair.publicKey());
       const xlmBalance = account.balances.find((b) => b.asset_type === 'native');

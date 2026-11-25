@@ -13,14 +13,13 @@
  * Requirements:
  *   RUN_TESTNET_E2E_TESTS=true   — enables the suite (skipped in CI by default)
  *   STELLAR_INTEGRATION_TESTS=true — disables the blockRealHttp guard
- *   Network access to horizon-testnet.stellar.org and friendbot.stellar.org
+ *   Network access to horizon-testnet.stellar.org
  *
  * Run manually:
  *   RUN_TESTNET_E2E_TESTS=true STELLAR_INTEGRATION_TESTS=true \
  *     npx jest tests/e2e/paymentPipelineTestnet.e2e.test.js --forceExit --runInBand
  *
- * The test creates fresh wallets on every run (funded by Friendbot), so no
- * pre-configured environment is needed beyond internet access.
+ * Configure the fixture master and mnemonic as described in docs/stellar-testnet-fixtures.md.
  */
 
 const ENABLED = process.env.RUN_TESTNET_E2E_TESTS === 'true';
@@ -32,7 +31,7 @@ process.env.JWT_SECRET   = process.env.JWT_SECRET   || 'e2e-testnet-secret-12345
 process.env.STELLAR_NETWORK = 'testnet';
 
 // Only load heavy deps when enabled to avoid slowing down the normal test suite
-let StellarSdk, Keypair, Networks, TransactionBuilder, Operation, Asset, BASE_FEE, Memo;
+let StellarSdk, Networks, TransactionBuilder, Operation, Asset, BASE_FEE, Memo;
 let mongoose, MongoMemoryServer;
 let School, Student, Payment, PaymentIntent, Receipt;
 let paymentController;
@@ -40,7 +39,7 @@ let webhookService, sseService;
 
 if (ENABLED) {
   StellarSdk = require('@stellar/stellar-sdk');
-  ({ Keypair, Networks, TransactionBuilder, Operation, Asset, BASE_FEE, Memo } = StellarSdk);
+  ({ Networks, TransactionBuilder, Operation, Asset, BASE_FEE, Memo } = StellarSdk);
 
   mongoose         = require('../../backend/node_modules/mongoose');
   MongoMemoryServer = require('mongodb-memory-server').MongoMemoryServer;
@@ -63,15 +62,6 @@ if (ENABLED) {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-async function fundViaFriendbot(publicKey) {
-  const res = await fetch(`https://friendbot.stellar.org?addr=${encodeURIComponent(publicKey)}`);
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`Friendbot failed (${res.status}): ${body}`);
-  }
-  return res.json();
-}
 
 async function submitRealPayment({ senderKeypair, destinationPublicKey, amount, memo }) {
   const senderAccount = await horizonServer.loadAccount(senderKeypair.publicKey());
@@ -140,15 +130,16 @@ function makeRes() {
 // ── Suite ─────────────────────────────────────────────────────────────────────
 
 describeIf('Full payment pipeline — live Stellar testnet (#1361)', () => {
+  let pool;
   let mongoServer;
   let schoolKeypair;  // school's Stellar wallet
   let senderKeypair;  // parent's Stellar wallet (pays the fee)
   let school;
   let student;
 
-  const FEE_AMOUNT_XLM = 10;  // small enough to send multiple times without draining Friendbot
+  const FEE_AMOUNT_XLM = 10;
 
-  // Long timeout — Friendbot + testnet confirmation + polling
+  // Long timeout — Fixture setup + testnet confirmation + polling
   jest.setTimeout(120_000);
 
   beforeAll(async () => {
@@ -156,19 +147,11 @@ describeIf('Full payment pipeline — live Stellar testnet (#1361)', () => {
     mongoServer = await MongoMemoryServer.create();
     await mongoose.connect(mongoServer.getUri());
 
-    // ── Generate and fund wallets ────────────────────────────────────────────
-    schoolKeypair  = Keypair.random();
-    senderKeypair  = Keypair.random();
-
-    console.log('[testnet-e2e] Funding wallets via Friendbot...');
-    console.log('[testnet-e2e]   School  wallet:', schoolKeypair.publicKey());
-    console.log('[testnet-e2e]   Sender  wallet:', senderKeypair.publicKey());
-
-    await Promise.all([
-      fundViaFriendbot(schoolKeypair.publicKey()),
-      fundViaFriendbot(senderKeypair.publicKey()),
-    ]);
-    console.log('[testnet-e2e] Both wallets funded.');
+    const { createStellarTestnetPool } = require('../fixtures/stellarTestnetPool');
+    pool = createStellarTestnetPool('paymentPipeline');
+    await pool.setup();
+    senderKeypair = await pool.claim();
+    schoolKeypair = await pool.claim();
 
     // ── Seed school and student in DB ────────────────────────────────────────
     // Override the app's stellarConfig to point at this fresh school wallet
@@ -196,8 +179,14 @@ describeIf('Full payment pipeline — live Stellar testnet (#1361)', () => {
   });
 
   afterAll(async () => {
-    await mongoose.disconnect();
-    if (mongoServer) await mongoServer.stop();
+    try {
+      if (senderKeypair) pool.release(senderKeypair);
+      if (schoolKeypair) pool.release(schoolKeypair);
+      await pool?.cleanup();
+    } finally {
+      await mongoose.disconnect();
+      if (mongoServer) await mongoServer.stop();
+    }
   });
 
   // ── Step 1: Payment instructions ──────────────────────────────────────────
