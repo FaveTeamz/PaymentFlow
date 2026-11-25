@@ -16,7 +16,7 @@ const {
   recordPayment,
   validatePaymentWithDynamicFee,
   determineConfirmationState,
-  pollForLedgerInclusion,
+  detectAsset,
 } = require('../services/stellarService');
 const { queueForRetry } = require('../services/retryService');
 const { transition: transitionPayment } = require('../services/paymentTransitionService');
@@ -24,9 +24,10 @@ const { server } = require('../config/stellarConfig');
 const { ACCEPTED_ASSETS } = require('../config/stellarConfig');
 const { validateTransactionHash } = require('../utils/hashValidator');
 const { getPaymentLimits, validatePaymentAmount } = require('../utils/paymentLimits');
-const { SUPPORTED_MEMO_TYPES } = require('../utils/stellarMemo');
+const { SUPPORTED_MEMO_TYPES, decodeMemoToCanonical } = require('../utils/stellarMemo');
 const { convertToLocalCurrency } = require('../services/currencyConversionService');
-const { withStellarRetry } = require('../utils/withStellarRetry');
+const { finishSubmission, submissionLockKey, SUBMISSION_LEASE_MS } = require('../services/paymentFeeBumpService');
+const { normalizeToNumber } = require('../utils/stellarAmount');
 const { makePaymentAuditLogger } = require('../utils/paymentAuditLogger');
 const lock = require('../services/distributedLock');
 const logger = require('../utils/logger');
@@ -188,126 +189,129 @@ async function createPaymentIntent(req, res, next) {
 }
 
 // ====================== SUBMIT XDR TRANSACTION ======================
+function sendSubmissionResult(res, payment) {
+  const hash = payment.txHash;
+  const feeBumpTxHash = payment.feeBumpTxHash || null;
+  if (payment.status === 'FAILED') {
+    return res.status(400).json({
+      verified: false, status: 'FAILED', hash, feeBumpTxHash,
+      error: 'Stellar payment could not be confirmed', code: payment.suspicionReason,
+    });
+  }
+  if (payment.status !== 'SUCCESS') {
+    return res.status(202).json({ verified: false, hash, feeBumpTxHash, status: payment.status });
+  }
+  return res.json({
+    verified: true, hash, feeBumpTxHash, status: 'SUCCESS',
+    ledger: payment.ledgerSequence,
+    confirmationState: payment.confirmationState,
+    explorerUrl: getExplorerUrl(payment.ledgerTransactionHash || hash),
+  });
+}
+
 async function submitTransaction(req, res, next) {
+  const { schoolId, school } = req;
+  let lease;
+  let lockKey;
+  let stopWatchdog;
   try {
     const { xdr, paymentIntentId } = req.body;
     if (!xdr) return res.status(400).json({ error: 'Missing xdr parameter', code: 'MISSING_XDR' });
 
-    const tx = new StellarSdk.Transaction(xdr, require('../config/stellarConfig').networkPassphrase);
-    const transactionHash = tx.hash().toString('hex');
-
-    const hashValidation = validateTransactionHash(transactionHash);
-    if (!hashValidation.valid) {
-      const err = new Error(hashValidation.error);
-      err.code = hashValidation.code;
-      return next(err);
-    }
-
-    const normalizedHash = hashValidation.normalized;
-    const memo = tx.memo.value ? tx.memo.value.toString() : null;
-    if (!memo) return res.status(400).json({ error: 'Transaction must include the student ID as a memo', code: 'MISSING_MEMO' });
-
-    // Issue #1035: Match the specific PENDING record via paymentIntentId when provided
-    // to avoid misattribution if multiple PENDING records exist for the same memo.
-    // When paymentIntentId is not provided, fall back to matching by memo (backward compatibility).
-    let paymentRecord;
-    if (paymentIntentId) {
-      const intent = await PaymentIntent.findById(paymentIntentId);
-      if (!intent) {
-        return res.status(404).json({ error: 'Payment intent not found', code: 'INTENT_NOT_FOUND' });
-      }
-      if (intent.schoolId !== req.schoolId) {
-        return res.status(403).json({ error: 'Payment intent does not belong to this school', code: 'INTENT_MISMATCH' });
-      }
-      if (intent.status !== 'pending') {
-        return res.status(400).json({ error: `Payment intent is not in pending status (status: ${intent.status})`, code: 'INTENT_NOT_PENDING' });
-      }
-
-      // Look for a PENDING payment record that corresponds to this intent
-      paymentRecord = await Payment.findOne({
-        schoolId: req.schoolId,
-        studentId: intent.studentId,
-        memo: intent.memo,
-        status: 'PENDING',
-      });
-    } else {
-      // Backward compatibility: match by memo alone (highest risk path)
-      paymentRecord = await Payment.findOne({ schoolId: req.schoolId, memo, status: 'PENDING' }).sort({ createdAt: -1 });
-    }
-
-    if (!paymentRecord) {
-      const studentObj = await Student.findOne({ schoolId: req.schoolId, studentId: memo });
-      if (!studentObj) return res.status(404).json({ error: 'Associated student not found in the database. Cannot process transaction.', code: 'STUDENT_NOT_FOUND' });
-      paymentRecord = new Payment({ schoolId: req.schoolId, studentId: studentObj.studentId || memo, memo, amount: 0 });
-    }
-
-    const transitionActor = req.user?.username || req.user?.id || 'payment-controller';
-    paymentRecord = (await transitionPayment(paymentRecord, 'SUBMITTED', {
-      performedBy: transitionActor,
-      schoolId: req.schoolId,
-      updates: { txHash: normalizedHash, transactionHash: normalizedHash, submittedAt: new Date() },
-      initialUpdates: { txHash: normalizedHash, transactionHash: normalizedHash },
-    })).payment;
-
-    // Submit the XDR to Horizon. A submission error (network/SDK) means the tx
-    // was never broadcast — fail immediately without polling.
-    let txResponse;
+    let tx;
     try {
-      txResponse = await withStellarRetry(() => server.submitTransaction(tx), { label: 'submitTransaction' });
-    } catch (err) {
-      paymentRecord = (await transitionPayment(paymentRecord, 'FAILED', {
-        performedBy: transitionActor,
-        schoolId: req.schoolId,
-        updates: { suspicionReason: err.response?.data?.extras?.result_codes?.transaction ?? err.message },
-      })).payment;
-      logger.warn('[PaymentController] submitTransaction on-chain failure', { txHash: normalizedHash, suspicionReason: paymentRecord.suspicionReason });
-      return res.status(400).json({ error: 'Transaction submission failed', code: 'TX_SUBMISSION_FAILED' });
+      tx = new StellarSdk.Transaction(xdr, require('../config/stellarConfig').networkPassphrase);
+    } catch {
+      return res.status(400).json({ error: 'Invalid transaction XDR', code: 'INVALID_XDR' });
     }
 
-    if (!txResponse.successful) {
-      paymentRecord = (await transitionPayment(paymentRecord, 'FAILED', {
-        performedBy: transitionActor,
-        schoolId: req.schoolId,
-        updates: {
-          confirmationStatus: 'failed',
-          suspicionReason: 'Transaction was included in ledger but failed on-chain',
-        },
-      })).payment;
-      return res.status(400).json({ error: 'Transaction was included in the ledger but failed on-chain', code: 'TX_FAILED', hash: transactionHash });
+    const txHash = tx.hash().toString('hex');
+    const rawMemo = tx.memo.value;
+    const memo = decodeMemoToCanonical(tx.memo.type === 'hash' ? rawMemo?.toString('hex') : rawMemo, tx.memo.type);
+    if (!memo) return res.status(400).json({ error: 'Transaction must include a valid payment memo', code: 'MISSING_MEMO' });
+    const [operation] = tx.operations;
+    if (tx.operations.length !== 1 || operation.type !== 'payment' ||
+        operation.destination !== school.stellarAddress || !tx.signatures.length) {
+      return res.status(400).json({ error: 'A signed payment to the school wallet is required', code: 'INVALID_PAYMENT' });
     }
-
-    paymentRecord = (await transitionPayment(paymentRecord, 'SUCCESS', {
-      performedBy: transitionActor,
-      schoolId: req.schoolId,
-      updates: { confirmedAt: new Date(), ledgerSequence: txResponse.ledger },
-    })).payment;
-
-    // Issue #1034: Update student balance fields using the unified balance updater.
-    // This ensures submitTransaction produces the same Student state updates as
-    // verifyPayment and syncPaymentsForSchool, eliminating divergence.
-    const { updateStudentBalance } = require('../utils/studentBalanceUpdater');
-    try {
-      await updateStudentBalance(req.schoolId, paymentRecord.studentId, {});
-    } catch (balanceErr) {
-      logger.error('Failed to update student balance after submitTransaction', {
-        schoolId: req.schoolId,
-        studentId: paymentRecord.studentId,
-        txHash: normalizedHash,
-        error: balanceErr.message,
-      });
-    }
-
-    const network = process.env.STELLAR_NETWORK === 'mainnet' ? 'public' : 'testnet';
-    res.json({
-      verified: true,
-      hash: normalizedHash,
-      ledger: pollResult.ledger || txResponse.ledger,
-      status: 'SUCCESS',
-      confirmationState: pollResult.confirmationState,
-      explorerUrl: `https://stellar.expert/explorer/${network}/tx/${transactionHash}`,
+    const asset = detectAsset({
+      asset_type: operation.asset.getAssetType(),
+      asset_code: operation.asset.getCode(),
+      asset_issuer: operation.asset.getIssuer(),
     });
+    if (!asset) return res.status(400).json({ error: 'Unsupported asset', code: 'UNSUPPORTED_ASSET' });
+    const amount = normalizeToNumber(operation.amount);
+    const limits = await validatePaymentAmount(amount, { schoolId, asset: asset.assetCode });
+    if (!limits.valid) return res.status(400).json({ error: limits.message, code: limits.code });
+
+    lockKey = submissionLockKey(schoolId, memo);
+    lease = await lock.acquire(lockKey, SUBMISSION_LEASE_MS);
+    if (lease) stopWatchdog = lock.startWatchdog(lockKey, lease.token, SUBMISSION_LEASE_MS);
+    const existing = await Payment.findOne({ schoolId, txHash, deletedAt: null });
+    if (existing) return sendSubmissionResult(res, existing);
+    if (!lease) return res.status(409).json({ error: 'Payment submission is in progress', code: 'SUBMISSION_IN_PROGRESS' });
+
+    const intent = paymentIntentId
+      ? await PaymentIntent.findOne({ _id: paymentIntentId, schoolId })
+      : await PaymentIntent.findOne({ schoolId, memo });
+    if (paymentIntentId && !intent) return res.status(404).json({ error: 'Payment intent not found', code: 'INTENT_NOT_FOUND' });
+    if (intent && (intent.schoolId !== schoolId || intent.memo !== memo)) {
+      return res.status(400).json({ error: 'Payment memo does not match the intent', code: 'INTENT_MISMATCH' });
+    }
+    if (intent && (intent.status !== 'pending' || intent.expiresAt <= new Date())) {
+      return res.status(400).json({ error: 'Payment intent is no longer pending', code: 'INTENT_NOT_PENDING' });
+    }
+
+    if (intent) {
+      const inFlight = await Payment.findOne({ schoolId, memo, status: 'SUBMITTED', deletedAt: null });
+      if (inFlight) return sendSubmissionResult(res, inFlight);
+    }
+    const studentId = intent?.studentId || memo;
+    const student = await Student.findOne({ schoolId, studentId });
+    if (!student) return res.status(404).json({ error: 'Associated student not found', code: 'STUDENT_NOT_FOUND' });
+
+    const pending = await Payment.findOne({ schoolId, studentId, memo, status: 'PENDING' }).sort({ createdAt: -1 });
+    const payment = pending || new Payment({ schoolId, studentId, memo, amount });
+    const options = { performedBy: req.user?.username || req.user?.id || 'payment-controller', schoolId };
+    const submitted = await transitionPayment(payment, 'SUBMITTED', {
+      ...options,
+      updates: {
+        txHash, transactionHash: txHash, submittedAt: new Date(), signedSubmissionXdr: xdr,
+        submissionIntentId: intent?._id,
+        amount, assetCode: asset.assetCode, assetType: asset.assetType, senderAddress: operation.source || tx.source,
+        feeAmount: intent?.amount ?? student.feeAmount,
+        feeCategory: intent?.feeCategory || undefined,
+      },
+      initialUpdates: { txHash, transactionHash: txHash },
+    });
+    if (submitted.unchanged) return sendSubmissionResult(res, submitted.payment);
+
+    const heldLease = lease;
+    const stopRenewal = stopWatchdog;
+    lease = null;
+    stopWatchdog = null;
+    const completion = finishSubmission(submitted.payment, tx, school, student, options.performedBy)
+      .finally(async () => {
+        stopRenewal();
+        await lock.release(lockKey, heldLease.token);
+      });
+    let responseTimer;
+    try {
+      const pendingResponse = new Promise(resolve => {
+        responseTimer = setTimeout(() => resolve(submitted.payment), 10_000);
+      });
+      return sendSubmissionResult(res, await Promise.race([completion, pendingResponse]));
+    } finally {
+      clearTimeout(responseTimer);
+      completion.catch(error => {
+        logger.error('Stellar payment submission will be recovered', { schoolId, txHash, error: error.message });
+      });
+    }
   } catch (err) {
-    next(err);
+    return next(err);
+  } finally {
+    stopWatchdog?.();
+    if (lease) await lock.release(lockKey, lease.token);
   }
 }
 
@@ -338,18 +342,21 @@ async function verifyPayment(req, res, next) {
     const audit = makePaymentAuditLogger(req, schoolId, normalizedHash);
 
     // Idempotency — return cached result if already recorded
-    const existing = await Payment.findOne({ schoolId, txHash: normalizedHash });
+    const existing = await Payment.findOne({
+      schoolId, $or: [{ txHash: normalizedHash }, { feeBumpTxHash: normalizedHash }],
+    });
     if (existing) {
       await audit.success({ txHash: normalizedHash, cached: true, studentId: existing.studentId, amount: existing.amount });
 
       const targetCurrency = req.school.localCurrency || 'USD';
       const conversion = await convertToLocalCurrency(existing.amount, existing.assetCode || 'XLM', targetCurrency);
-      const stellarExplorerUrl = getExplorerUrl(existing.txHash);
+      const stellarExplorerUrl = getExplorerUrl(existing.ledgerTransactionHash || existing.feeBumpTxHash || existing.txHash);
 
       return res.json({
-        verified: true,
+        verified: existing.status === 'SUCCESS',
         cached: true,
         hash: existing.txHash,
+        feeBumpTxHash: existing.feeBumpTxHash || null,
         stellarExplorerUrl,
         explorerUrl: stellarExplorerUrl,
         memo: existing.memo,
@@ -484,6 +491,7 @@ async function verifyPayment(req, res, next) {
             schoolId,
             studentId: studentStrId,
             txHash: result.hash,
+            feeBumpTxHash: result.feeBumpTxHash,
             amount: result.amount,
             feeAmount: result.feeAmount || studentObj.feeAmount,
             feeValidationStatus,
@@ -502,7 +510,7 @@ async function verifyPayment(req, res, next) {
           if (dupErr.code === 'DUPLICATE_TX') {
             // Concurrent path (poller or another verify call) already recorded this tx.
             // Fetch and return the existing record as a cache hit.
-            const cached = await Payment.findOne({ schoolId, txHash: normalizedHash });
+            const cached = await Payment.findOne({ schoolId, txHash: result.hash });
             if (cached) {
               await audit.success({ txHash: normalizedHash, cached: true, studentId: studentStrId, amount: cached.amount });
               const targetCurrency = req.school.localCurrency || 'USD';
@@ -576,7 +584,7 @@ async function verifyPayment(req, res, next) {
 
       const targetCurrency = req.school.localCurrency || 'USD';
       const conversion = await convertToLocalCurrency(result.amount, result.assetCode || 'XLM', targetCurrency);
-      const stellarExplorerUrl = getExplorerUrl(result.hash);
+      const stellarExplorerUrl = getExplorerUrl(result.feeBumpTxHash || result.hash);
 
       res.json({
         verified: true,

@@ -307,6 +307,7 @@ connectDatabase().then(async () => {
   // and retry selector are safe for multi-instance.  All other schedulers run
   // only on the elected leader to prevent N× concurrent execution when scaled.
   const leaderElection = require('./services/leaderElection');
+  const { startPaymentSubmissionRecovery, stopPaymentSubmissionRecovery } = require('./services/paymentFeeBumpService');
 
   const startLeaderSchedulers = () => {
     logger.info('[Leader] Starting leader-only schedulers');
@@ -315,6 +316,7 @@ connectDatabase().then(async () => {
     startSessionCleanupScheduler();
     startReconciliationScheduler();
     startStuckPaymentReconciliationScheduler();
+    startPaymentSubmissionRecovery();
     startRetentionScheduler();
     startWebhookRetryScheduler();
     startReconciliationReportScheduler();
@@ -329,6 +331,7 @@ connectDatabase().then(async () => {
     stopSessionCleanupScheduler();
     stopReconciliationScheduler();
     stopStuckPaymentReconciliationScheduler();
+    stopPaymentSubmissionRecovery();
     stopRetentionScheduler().catch((err) => logger.error('Retention scheduler shutdown failed', { error: err.message }));
     stopWebhookRetryScheduler();
     stopReconciliationReportScheduler();

@@ -216,6 +216,7 @@ async function processPendingVerifications() {
           studentId: result.studentId || result.memo,
           txHash: result.hash,
           transactionHash: result.hash,
+          feeBumpTxHash: result.feeBumpTxHash,
           amount: result.amount,
           feeAmount: result.expectedAmount || result.feeAmount,
           feeValidationStatus: result.feeValidation.status,

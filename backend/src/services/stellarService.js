@@ -1,9 +1,10 @@
 "use strict";
 
-const { Operation } = require("@stellar/stellar-sdk");
+const { Operation, TransactionBuilder } = require("@stellar/stellar-sdk");
 const {
   server,
   isAcceptedAsset,
+  networkPassphrase,
   CONFIRMATION_THRESHOLD,
   FINALIZATION_THRESHOLD,
 } = require("../config/stellarConfig");
@@ -69,6 +70,18 @@ function normalizeAmount(rawAmount) {
   return parseFloat(Operation._fromXDRAmount(stroops));
 }
 
+function transactionMemo(tx) {
+  const inner = tx.inner_transaction || tx;
+  const type = inner.memo_type || tx.memo_type;
+  if (type && type !== 'none') return { memoType: type, memoValue: inner.memo ?? tx.memo };
+  if (tx.inner_transaction && tx.envelope_xdr) {
+    const envelope = TransactionBuilder.fromXDR(tx.envelope_xdr, networkPassphrase);
+    const memo = envelope.innerTransaction?.memo;
+    if (memo) return { memoType: memo.type, memoValue: memo.type === 'hash' ? memo.value?.toString('hex') : memo.value };
+  }
+  return { memoType: 'none', memoValue: null };
+}
+
 /**
  * Extract and validate the payment operation from a transaction.
  * Handles fee-bump transactions by unwrapping to the inner transaction.
@@ -91,7 +104,7 @@ async function extractValidPayment(tx, walletAddress) {
   const innerTx = tx.inner_transaction || tx;
 
   // Check memo type and handle accordingly
-  const memoType = innerTx.memo_type || 'none';
+  const { memoType, memoValue } = transactionMemo(tx);
   
   if (memoType === 'none') {
     // No memo provided
@@ -109,7 +122,7 @@ async function extractValidPayment(tx, walletAddress) {
   }
 
   // MEMO_ID / MEMO_HASH decode back to the canonical intent memo (#1118).
-  const memo = decodeMemoToCanonical(innerTx.memo, memoType);
+  const memo = decodeMemoToCanonical(memoValue, memoType);
   if (!memo) {
     logger.warn('Transaction memo could not be decoded to a payment reference', {
       txHash: tx.hash,
@@ -118,7 +131,7 @@ async function extractValidPayment(tx, walletAddress) {
     return null;
   }
 
-  const ops = await withStellarRetry(() => innerTx.operations(), {
+  const ops = await withStellarRetry(() => typeof innerTx.operations === "function" ? innerTx.operations() : tx.operations(), {
     label: "extractValidPayment.operations",
     context: `Transaction ${tx.hash} operations`,
   });
@@ -520,7 +533,7 @@ async function verifyTransaction(txHash, walletAddress, schoolId = null) {
   const innerTx = tx.inner_transaction || tx;
 
   // 2. Find matching payment operation first (destination + asset checks before memo)
-  const ops = await withStellarRetry(() => innerTx.operations(), {
+  const ops = await withStellarRetry(() => typeof innerTx.operations === "function" ? innerTx.operations() : tx.operations(), {
     label: "verifyTransaction.operations",
     context: `Transaction ${txHash} operations`,
   });
@@ -548,7 +561,7 @@ async function verifyTransaction(txHash, walletAddress, schoolId = null) {
   }
 
   // 3. Check memo type (after destination/asset are validated)
-  const memoType = innerTx.memo_type || 'none';
+  const { memoType, memoValue } = transactionMemo(tx);
 
   if (memoType === 'none') {
     const err = new Error(
@@ -570,7 +583,7 @@ async function verifyTransaction(txHash, walletAddress, schoolId = null) {
     throw err;
   }
 
-  const memo = decodeMemoToCanonical(innerTx.memo, memoType);
+  const memo = decodeMemoToCanonical(memoValue, memoType);
   if (!memo) {
     // A non-text memo that fails to decode carries no student identity — it is
     // an unrecognised value rather than a missing one, so report it as such.
@@ -621,7 +634,8 @@ async function verifyTransaction(txHash, walletAddress, schoolId = null) {
   const networkFee = parseFloat(tx.fee_paid || "0") / 10000000; // Convert stroops to XLM
 
   return {
-    hash: tx.hash,
+    hash: tx.inner_transaction?.hash || tx.hash,
+    ...(tx.inner_transaction?.hash ? { feeBumpTxHash: tx.hash } : {}),
     memo: memo,
     studentId: memo,
     amount: amount,
@@ -679,7 +693,8 @@ async function syncPaymentsForSchool(school) {
     for (const tx of page.records) {
       summary.found++;
 
-      const existing = await Payment.findOne({ txHash: tx.hash, schoolId, deletedAt: null });
+      const canonicalHash = tx.inner_transaction?.hash || tx.hash;
+      const existing = await Payment.findOne({ txHash: canonicalHash, schoolId, deletedAt: null });
       if (existing) { summary.alreadyProcessed++; done = true; break; }
 
       summary.new++;
@@ -856,8 +871,9 @@ async function syncPaymentsForSchool(school) {
           await savePayment({
             schoolId,
             studentId,
-            txHash: tx.hash,
-            correlationId: deriveCorrelationId(tx.hash),
+            txHash: canonicalHash,
+            feeBumpTxHash: tx.inner_transaction?.hash ? tx.hash : undefined,
+            correlationId: deriveCorrelationId(canonicalHash),
             amount: paymentAmount,
             feeAmount: feeAmountForRecord,
             feeCategory,
@@ -1097,7 +1113,8 @@ async function parseIncomingTransaction(txHash, walletAddress = null) {
     { label: "parseIncomingTransaction", context: `Transaction ${txHash}` },
   );
 
-  const memo = tx.memo ? tx.memo.trim() : null;
+  const { memoType, memoValue } = transactionMemo(tx);
+  const memo = decodeMemoToCanonical(memoValue, memoType);
 
   const ops = await withStellarRetry(() => tx.operations(), {
     label: "parseIncomingTransaction.operations",
@@ -1197,7 +1214,8 @@ async function pollForLedgerInclusion(paymentDoc, txHash, opts = {}) {
     if (attempt > 1) {
       const base  = Math.min(initialDelayMs * 2 ** (attempt - 2), maxDelayMs);
       const jitter = Math.floor(base * 0.3 * Math.random());
-      const wait  = base + jitter;
+      const untilWake = opts.wakeAt > Date.now() ? opts.wakeAt - Date.now() : Infinity;
+      const wait = Math.min(base + jitter, untilWake);
       logger.debug('Ledger finality poll waiting before next attempt', { txHash, attempt, waitMs: wait });
       await new Promise((r) => setTimeout(r, wait));
     }
@@ -1208,7 +1226,7 @@ async function pollForLedgerInclusion(paymentDoc, txHash, opts = {}) {
     let tx;
     try {
       tx = await withStellarRetry(
-        () => server.transactions().transaction(txHash).call(),
+        opts.findTransaction || (() => server.transactions().transaction(txHash).call()),
         { label: 'pollForLedgerInclusion', context: `Transaction ${txHash}`, maxAttempts: 1 },
       );
       lastNetworkError = null; // reset on successful fetch
@@ -1226,14 +1244,11 @@ async function pollForLedgerInclusion(paymentDoc, txHash, opts = {}) {
       continue;
     }
 
+    opts.onInclusion?.(tx);
+
     // 2. Check on-chain success flag. A tx can be included but failed (#840).
     if (tx.successful === false) {
       logger.warn('Transaction failed on-chain during finality poll', { txHash });
-      const confirmation = await determineConfirmationState(
-        tx.ledger_attr || tx.ledger || null,
-        CONFIRMATION_STATES.DETECTED,
-        false,
-      );
       return {
         status: 'FAILED',
         failureReason: PAYMENT_FAILURE_REASONS.TX_FAILED_ON_CHAIN,
@@ -1245,11 +1260,16 @@ async function pollForLedgerInclusion(paymentDoc, txHash, opts = {}) {
 
     // 3. Evaluate finality against the confirmation state machine
     const txLedger = tx.ledger_attr || tx.ledger || null;
-    const { state: nextState, changed, confirmationStatus } = await determineConfirmationState(
+    const checkConfirmation = determineConfirmationState(
       txLedger,
       paymentDoc.confirmationState || CONFIRMATION_STATES.DETECTED,
       paymentDoc.isSuspicious || false,
     );
+    const { state: nextState, changed, confirmationStatus } = await (opts.stopOnInclusion
+      ? checkConfirmation.catch(() => ({
+        state: CONFIRMATION_STATES.DETECTED, changed: false, confirmationStatus: 'pending_confirmation',
+      }))
+      : checkConfirmation);
 
     logger.debug('Finality poll state check', {
       txHash, attempt, txLedger, nextState, changed,
@@ -1261,8 +1281,8 @@ async function pollForLedgerInclusion(paymentDoc, txHash, opts = {}) {
       paymentDoc.confirmationState = nextState;
     }
 
-    if (isConfirmedOrAbove(nextState)) {
-      logger.info('Transaction reached ledger finality', {
+    if (isConfirmedOrAbove(nextState) || (opts.stopOnInclusion && txLedger && tx.successful)) {
+      logger.info('Transaction found in the ledger', {
         txHash, confirmationState: nextState, attempts: attempt,
       });
       return {
