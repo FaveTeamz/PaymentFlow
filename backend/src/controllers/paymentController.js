@@ -242,7 +242,7 @@ async function submitTransaction(req, res, next) {
     if (!asset) return res.status(400).json({ error: 'Unsupported asset', code: 'UNSUPPORTED_ASSET' });
     const amount = normalizeToNumber(operation.amount);
     const limits = await validatePaymentAmount(amount, { schoolId, asset: asset.assetCode });
-    if (!limits.valid) return res.status(400).json({ error: limits.message, code: limits.code });
+    if (!limits.valid) return res.status(400).json({ error: limits.error, code: limits.code });
 
     lockKey = submissionLockKey(schoolId, memo);
     lease = await lock.acquire(lockKey, SUBMISSION_LEASE_MS);
